@@ -23,6 +23,9 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - python/transcribe.py
+    - python/dub_video.py
 
 flutter_launcher_icons:
   android: "launcher_icon"

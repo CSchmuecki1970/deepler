@@ -8,6 +8,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:io';
+import 'media_transcriber.dart';
+import 'extraction_activity.dart';
+import 'audio_exporter.dart';
+import 'timed_transcript.dart';
+import 'timeline_translator.dart';
+import 'video_exporter.dart';
+import 'translation_language.dart';
 
 void main() {
   runApp(const MainApp());
@@ -74,13 +81,50 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
   final TextEditingController _inputController = TextEditingController();
   final TextEditingController _apiKeyController = TextEditingController();
   final TextEditingController _fileNameController = TextEditingController();
+  final TextEditingController _pythonPathController = TextEditingController();
+  final TextEditingController _whisperModelController = TextEditingController(
+    text: 'small',
+  );
+  final TextEditingController _whisperLanguageController =
+      TextEditingController(text: 'auto');
   String _translatedText = '';
+  TranslationLanguage _targetLanguage = TranslationLanguage.german;
+  TranslationLanguage _translationLanguage = TranslationLanguage.german;
   bool _isLoading = false;
+  bool _isExtractingMediaText = false;
+  ExtractionPhase _extractionPhase = ExtractionPhase.preparing;
   String _errorMessage = '';
+  String _selectedMediaPath = '';
+  String _selectedMediaName = 'No media file selected';
   final List<String> _logs = [];
   bool _showLogs = false;
   bool _saveApiKey = true;
   bool _isExporting = false;
+  bool _isExportingAudio = false;
+  final AudioExporter _audioExporter = AudioExporter();
+  final VideoExporter _videoExporter = VideoExporter();
+  String _audioStatus = '';
+  double? _audioProgress;
+  String _audioVoice = 'de-DE-KatjaNeural';
+  int _audioRate = 0;
+  bool _mixOriginalAudio = true;
+  TimedTranscript? _sourceTranscript;
+  TimedTranscript? _translatedTimeline;
+  bool _isExportingVideo = false;
+  String _videoStatus = '';
+  double? _videoProgress;
+  String _translationStatus = '';
+
+  bool get _hasVideo => RegExp(
+    r'\.(mp4|mov|mkv|avi|wmv|webm|m4v|flv)$',
+    caseSensitive: false,
+  ).hasMatch(_selectedMediaPath);
+
+  bool get _canExportTimedAudio =>
+      _translatedTimeline != null &&
+      _translatedTimeline!.source == _selectedMediaPath &&
+      _translatedTimeline!.text == _translatedText;
+  bool get _canExportVideo => _hasVideo && _canExportTimedAudio;
   double _pdfFontSize = 12.0;
   String? _selectedDirectory;
   String _selectedDirectoryName = 'Default (Documents)';
@@ -89,6 +133,7 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
   void initState() {
     super.initState();
     _loadApiKey();
+    _loadWhisperSettings();
   }
 
   Future<void> _loadApiKey() async {
@@ -126,6 +171,511 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
           duration: const Duration(seconds: 2),
         ),
       );
+    }
+  }
+
+  Future<void> _loadWhisperSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedPythonPath = prefs.getString('whisper_python_path') ?? '';
+      final pythonPath = savedPythonPath.isEmpty
+          ? await MediaTranscriber.defaultPython()
+          : savedPythonPath;
+      final savedModel = prefs.getString('whisper_model') ?? 'small';
+      final savedLanguage = prefs.getString('whisper_language') ?? 'auto';
+      final targetLanguage = TranslationLanguage.fromCode(
+        prefs.getString('translation_target_language'),
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _pythonPathController.text = pythonPath;
+        _whisperModelController.text = savedModel;
+        _whisperLanguageController.text = savedLanguage;
+        _targetLanguage = targetLanguage;
+      });
+    } catch (e) {
+      _addLog('Error loading Whisper settings: $e');
+    }
+  }
+
+  Future<void> _saveWhisperSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        'whisper_python_path',
+        _pythonPathController.text.trim(),
+      );
+      await prefs.setString(
+        'whisper_model',
+        _whisperModelController.text.trim(),
+      );
+      await prefs.setString(
+        'whisper_language',
+        _whisperLanguageController.text.trim(),
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Whisper settings saved'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error saving Whisper settings: $e'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  Future<void> _selectMediaFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: [
+          'mp3',
+          'wav',
+          'm4a',
+          'mp4',
+          'mov',
+          'mkv',
+          'avi',
+          'wmv',
+          'webm',
+        ],
+        allowMultiple: false,
+      );
+
+      if (result != null && result.files.single.path != null) {
+        final path = result.files.single.path!;
+        setState(() {
+          if (_selectedMediaPath != path) {
+            _sourceTranscript = null;
+            _translatedTimeline = null;
+          }
+          _selectedMediaPath = path;
+          _selectedMediaName = path.split(Platform.pathSeparator).last;
+        });
+        _addLog('Selected media file: $path');
+      }
+    } catch (e) {
+      _addLog('Error selecting media file: $e');
+    }
+  }
+
+  Future<void> _extractTextFromMedia() async {
+    if (_selectedMediaPath.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please select a video or audio file first'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    final pythonExecutable = _pythonPathController.text.trim().isEmpty
+        ? await MediaTranscriber.defaultPython()
+        : _pythonPathController.text.trim();
+    if (!mounted) return;
+    if (pythonExecutable.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please set a Python executable path first'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _isExtractingMediaText = true;
+      _extractionPhase = ExtractionPhase.preparing;
+      _showLogs = true;
+      _errorMessage = '';
+    });
+
+    try {
+      final extractedText = await MediaTranscriber().transcribe(
+        python: pythonExecutable,
+        input: _selectedMediaPath,
+        model: _whisperModelController.text.trim().isEmpty
+            ? 'small'
+            : _whisperModelController.text.trim(),
+        language: _whisperLanguageController.text.trim().isEmpty
+            ? 'auto'
+            : _whisperLanguageController.text.trim(),
+        onLog: (line) {
+          if (!mounted) return;
+          final phase = line.startsWith('Lade Modell')
+              ? ExtractionPhase.loading
+              : line.startsWith('Transkribiere:') || line.startsWith('[')
+              ? ExtractionPhase.recognizing
+              : line.startsWith('Fertig.') ||
+                    line.startsWith('Detected language:')
+              ? ExtractionPhase.finishing
+              : null;
+          if (phase != null && phase != _extractionPhase) {
+            setState(() => _extractionPhase = phase);
+          }
+          _addLog(line);
+        },
+      );
+      if (!mounted) return;
+
+      setState(() {
+        _inputController.text = extractedText.text;
+        _sourceTranscript = extractedText;
+        _selectedMediaPath = extractedText.source;
+        _translatedTimeline = null;
+        _errorMessage = '';
+      });
+
+      _addLog('Transcript loaded into input field');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Text extracted successfully from $_selectedMediaName'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _addLog('Error extracting text from media: $e');
+      setState(() {
+        _errorMessage = 'Whisper error: $e';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Extraction failed: $e'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isExtractingMediaText = false;
+        });
+      }
+    }
+  }
+
+  Future<({String voice, int rate, bool timed, bool mixOriginalAudio})?>
+  _chooseSpeechOptions({bool forVideo = false}) async {
+    final voices = _translationLanguage.voices;
+    var voice = voices.any((option) => option.$1 == _audioVoice)
+        ? _audioVoice
+        : voices.first.$1;
+    var rate = _audioRate;
+    var timed = forVideo || _canExportTimedAudio;
+    var mixOriginalAudio = _mixOriginalAudio;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, updateDialog) => AlertDialog(
+          title: Text(
+            forVideo ? _translationLanguage.videoLabel : 'Als MP3 speichern',
+          ),
+          content: SizedBox(
+            width: 380,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  DropdownButtonFormField<String>(
+                    initialValue: voice,
+                    isExpanded: true,
+                    decoration: InputDecoration(
+                      labelText: 'Stimme (${_translationLanguage.label})',
+                    ),
+                    items: voices
+                        .map(
+                          (option) => DropdownMenuItem(
+                            value: option.$1,
+                            child: Text(option.$2),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: (value) {
+                      if (value != null) updateDialog(() => voice = value);
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  if (!forVideo) ...[
+                    if (_canExportTimedAudio)
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text(
+                          'Ursprüngliche Startzeiten berücksichtigen',
+                        ),
+                        subtitle: const Text(
+                          'Pausen bleiben erhalten. Läuft ein Abschnitt noch, '
+                          'schließt der nächste ohne Überschneidung an. '
+                          'Das eingestellte Sprechtempo bleibt unverändert.',
+                        ),
+                        value: timed,
+                        onChanged: (value) =>
+                            updateDialog(() => timed = value ?? false),
+                      )
+                    else
+                      const Text(
+                        'Keine passenden Zeitstempel vorhanden. Die MP3 wird fortlaufend vorgelesen. '
+                        'Für ursprüngliche Startzeiten zuerst die Mediendatei extrahieren '
+                        'und abschnittsweise übersetzen.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    const SizedBox(height: 16),
+                  ],
+                  if (forVideo) ...[
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text(
+                        'Originalton leise im Hintergrund (25 %)',
+                      ),
+                      subtitle: const Text(
+                        'Übersetzung und gedämpfter Originalton werden gleichzeitig '
+                        'abgespielt. Ohne Häkchen enthält die Standardspur nur die '
+                        'Übersetzung. Der Originalton bleibt separat auswählbar.',
+                      ),
+                      value: mixOriginalAudio,
+                      onChanged: (value) =>
+                          updateDialog(() => mixOriginalAudio = value ?? false),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Jeder Abschnitt startet frühestens am ursprünglichen Zeitstempel. '
+                      'Läuft der vorherige Abschnitt noch, schließt der nächste direkt daran an. '
+                      'Das eingestellte Sprechtempo bleibt unverändert. '
+                      'Bei Bedarf bleibt das letzte Bild bis zum Sprachende stehen. '
+                      'Die zusätzliche Originaltonspur hat 25 % Lautstärke.',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+                  Text(
+                    'Sprechtempo: ${rate == 0 ? 'Normal' : '${rate > 0 ? '+' : ''}$rate %'}',
+                  ),
+                  Slider(
+                    value: rate.toDouble(),
+                    min: -30,
+                    max: 30,
+                    divisions: 12,
+                    label: '${rate > 0 ? '+' : ''}$rate %',
+                    onChanged: (value) =>
+                        updateDialog(() => rate = value.round()),
+                  ),
+                  const Text(
+                    'Die Sprachausgabe benötigt Internet. Der Übersetzungstext '
+                    'wird dafür an Microsoft übermittelt. Kein API-Schlüssel nötig.',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Abbrechen'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Speicherort wählen'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (confirmed != true || !mounted) return null;
+    return (
+      voice: voice,
+      rate: rate,
+      timed: timed,
+      mixOriginalAudio: mixOriginalAudio,
+    );
+  }
+
+  Future<void> _exportMp3() async {
+    if (_isExportingAudio || _translatedText.trim().isEmpty) return;
+    final text = _translatedText;
+    final timeline = _canExportTimedAudio ? _translatedTimeline : null;
+    final options = await _chooseSpeechOptions();
+    if (options == null || !mounted) return;
+    final voice = options.voice;
+    final rate = options.rate;
+    try {
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'MP3 speichern',
+        fileName: 'Uebersetzung_${DateTime.now().millisecondsSinceEpoch}.mp3',
+        type: FileType.custom,
+        allowedExtensions: ['mp3'],
+        lockParentWindow: true,
+      );
+      if (path == null || !mounted) return;
+      final output = path.toLowerCase().endsWith('.mp3') ? path : '$path.mp3';
+      if (output != path && await File(output).exists()) {
+        if (!mounted) return;
+        final replace = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Datei ersetzen?'),
+            content: Text('Diese MP3 existiert bereits:\n$output'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Abbrechen'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Ersetzen'),
+              ),
+            ],
+          ),
+        );
+        if (replace != true) return;
+      }
+      if (!mounted) return;
+      setState(() {
+        _audioVoice = voice;
+        _audioRate = rate;
+        _isExportingAudio = true;
+        _audioStatus = 'Die Audiodatei wird erzeugt …';
+        _audioProgress = null;
+        _errorMessage = '';
+      });
+      final python = _pythonPathController.text.trim().isEmpty
+          ? await MediaTranscriber.defaultPython()
+          : _pythonPathController.text.trim();
+      if (mounted) _addLog('MP3 erstellen: $voice, Tempo $rate %');
+      await _audioExporter.export(
+        python: python,
+        text: text,
+        voice: voice,
+        rate: rate,
+        output: output,
+        transcript: options.timed ? timeline : null,
+        onProgress: (message, done, total) {
+          if (!mounted) return;
+          setState(() {
+            _audioStatus = message;
+            if (done != null && total != null && total > 0) {
+              _audioProgress = done < total ? done / total : null;
+            }
+          });
+          _addLog(message);
+        },
+      );
+      if (!mounted) return;
+      _addLog('MP3 gespeichert: $output');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('MP3 gespeichert: $output'),
+          duration: const Duration(seconds: 8),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _addLog('MP3-Export fehlgeschlagen: $e');
+      setState(() => _errorMessage = 'MP3-Export fehlgeschlagen: $e');
+    } finally {
+      if (mounted) setState(() => _isExportingAudio = false);
+    }
+  }
+
+  Future<void> _exportVideo() async {
+    if (!_canExportVideo || _isExportingVideo) return;
+    final timeline = _translatedTimeline!;
+    final options = await _chooseSpeechOptions(forVideo: true);
+    if (options == null || !mounted) return;
+    try {
+      final sourceName = File(timeline.source).uri.pathSegments.last;
+      final stem = sourceName.substring(0, sourceName.lastIndexOf('.'));
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: '${_translationLanguage.videoLabel} speichern',
+        fileName: '$stem.${_translationLanguage.code}.mp4',
+        type: FileType.custom,
+        allowedExtensions: ['mp4'],
+        lockParentWindow: true,
+      );
+      if (path == null || !mounted) return;
+      final output = path.toLowerCase().endsWith('.mp4') ? path : '$path.mp4';
+      if (output != path && await File(output).exists()) {
+        if (!mounted) return;
+        final replace = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Datei ersetzen?'),
+            content: Text('Dieses Video existiert bereits:\n$output'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Abbrechen'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Ersetzen'),
+              ),
+            ],
+          ),
+        );
+        if (replace != true) return;
+      }
+      if (!mounted) return;
+      setState(() {
+        _isExportingVideo = true;
+        _videoStatus =
+            'Tonspur (${_translationLanguage.label}) wird vorbereitet …';
+        _videoProgress = null;
+        _audioVoice = options.voice;
+        _audioRate = options.rate;
+        _mixOriginalAudio = options.mixOriginalAudio;
+        _errorMessage = '';
+      });
+      final python = _pythonPathController.text.trim().isEmpty
+          ? await MediaTranscriber.defaultPython()
+          : _pythonPathController.text.trim();
+      final delayed = await _videoExporter.export(
+        python: python,
+        transcript: timeline,
+        voice: options.voice,
+        rate: options.rate,
+        output: output,
+        mixOriginalAudio: options.mixOriginalAudio,
+        onProgress: (message, done, total) {
+          if (!mounted) return;
+          setState(() {
+            _videoStatus = message;
+            if (done != null && total != null && total > 0) {
+              _videoProgress = done < total ? done / total : null;
+            }
+          });
+          _addLog(message);
+        },
+      );
+      if (!mounted) return;
+      _addLog(
+        'Video (${_translationLanguage.label}) gespeichert: $output ($delayed Abschnitte später gestartet)',
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Video gespeichert: $output'
+            '${delayed > 0 ? '\n$delayed Abschnitte wurden ohne Überlappung später gestartet.' : ''}',
+          ),
+          duration: const Duration(seconds: 10),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      final message = e.toString().replaceFirst(RegExp(r'^Exception: '), '');
+      _addLog('Videoexport fehlgeschlagen: $message');
+      setState(() => _errorMessage = 'Videoexport fehlgeschlagen: $message');
+    } finally {
+      if (mounted) setState(() => _isExportingVideo = false);
     }
   }
 
@@ -273,7 +823,7 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
           margin: const pw.EdgeInsets.all(40),
           build: (pw.Context context) => [
             pw.Text(
-              'Translation (German)',
+              'Translation (${_translationLanguage.englishLabel})',
               style: pw.TextStyle(
                 fontSize: _pdfFontSize + 6,
                 fontWeight: pw.FontWeight.bold,
@@ -351,6 +901,9 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
     _inputController.dispose();
     _apiKeyController.dispose();
     _fileNameController.dispose();
+    _pythonPathController.dispose();
+    _whisperModelController.dispose();
+    _whisperLanguageController.dispose();
     super.dispose();
   }
 
@@ -369,13 +922,42 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
   }
 
   Future<void> _cacheTranslation() async {
+    final originalText = _inputController.text;
+    final translatedText = _translatedText;
+    final language = _translationLanguage;
+    final source = _sourceTranscript;
+    final translation = _translatedTimeline;
     try {
       final prefs = await SharedPreferences.getInstance();
       final timestamp = DateTime.now().toString();
-      await prefs.setString('last_translation_original', _inputController.text);
-      await prefs.setString('last_translation_german', _translatedText);
+      await prefs.setString('last_translation_original', originalText);
+      await prefs.setString('last_translation_text', translatedText);
+      await prefs.setString('last_translation_language', language.code);
+      // Keep the legacy key only for German translations.
+      if (language == TranslationLanguage.german) {
+        await prefs.setString('last_translation_german', translatedText);
+      } else {
+        await prefs.remove('last_translation_german');
+      }
       await prefs.setString('last_translation_time', timestamp);
-      _addLog('Translation cached successfully');
+      if (source != null &&
+          translation != null &&
+          source.text == originalText &&
+          translation.text == translatedText &&
+          source.hasSameTiming(translation)) {
+        await prefs.setString(
+          'last_source_timeline',
+          jsonEncode(source.toJson()),
+        );
+        await prefs.setString(
+          'last_translated_timeline',
+          jsonEncode(translation.toJson()),
+        );
+      } else {
+        await prefs.remove('last_source_timeline');
+        await prefs.remove('last_translated_timeline');
+      }
+      if (mounted) _addLog('Translation cached successfully');
     } catch (e) {
       _addLog('Error caching translation: $e');
     }
@@ -385,13 +967,49 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final original = prefs.getString('last_translation_original');
-      final german = prefs.getString('last_translation_german');
+      final translatedText =
+          prefs.getString('last_translation_text') ??
+          prefs.getString('last_translation_german');
       final time = prefs.getString('last_translation_time');
 
-      if (original != null && german != null) {
+      if (original != null && translatedText != null) {
+        TimedTranscript? source;
+        TimedTranscript? translation;
+        try {
+          final storedSource = prefs.getString('last_source_timeline');
+          final storedTranslation = prefs.getString('last_translated_timeline');
+          if (storedSource != null && storedTranslation != null) {
+            final candidateSource = TimedTranscript.fromJson(
+              jsonDecode(storedSource) as Map<String, dynamic>,
+            );
+            final candidateTranslation = TimedTranscript.fromJson(
+              jsonDecode(storedTranslation) as Map<String, dynamic>,
+            );
+            if (candidateSource.text == original &&
+                candidateTranslation.text == translatedText &&
+                candidateSource.hasSameTiming(candidateTranslation)) {
+              source = candidateSource;
+              translation = candidateTranslation;
+            }
+          }
+        } catch (_) {
+          // Older or incomplete caches still load as plain text.
+        }
+        if (!mounted) return;
         setState(() {
           _inputController.text = original;
-          _translatedText = german;
+          _translatedText = translatedText;
+          _translationLanguage = TranslationLanguage.fromCode(
+            translation?.language ??
+                prefs.getString('last_translation_language'),
+          );
+          _targetLanguage = _translationLanguage;
+          _sourceTranscript = source;
+          _translatedTimeline = translation;
+          if (source != null) {
+            _selectedMediaPath = source.source;
+            _selectedMediaName = File(source.source).uri.pathSegments.last;
+          }
         });
         _addLog('Translation loaded from cache');
         _addLog('Cached at: $time');
@@ -634,9 +1252,13 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
         content: TextField(
           controller: editController,
           maxLines: 12,
-          decoration: const InputDecoration(
+          decoration: InputDecoration(
             hintText: 'Edit your translation here...',
-            border: OutlineInputBorder(),
+            border: const OutlineInputBorder(),
+            helperText: _translatedTimeline != null
+                ? 'Für die Zeitzuordnung eine Zeile pro Abschnitt beibehalten.'
+                : null,
+            helperMaxLines: 2,
           ),
         ),
         actions: [
@@ -648,6 +1270,9 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
             onPressed: () {
               setState(() {
                 _translatedText = editController.text;
+                _translatedTimeline = _translatedTimeline?.editedText(
+                  editController.text,
+                );
               });
               _addLog('Translation edited');
               Navigator.pop(context);
@@ -671,6 +1296,8 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
       if (clipboardData != null && clipboardData.text != null) {
         setState(() {
           _translatedText = clipboardData.text!;
+          _translationLanguage = _targetLanguage;
+          _translatedTimeline = null;
         });
         _addLog('Translation imported from clipboard');
         ScaffoldMessenger.of(context).showSnackBar(
@@ -698,7 +1325,60 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
     }
   }
 
+  Future<void> _translateTimedTranscript(TimedTranscript source) async {
+    final targetLanguage = _targetLanguage;
+    setState(() {
+      _isLoading = true;
+      _translatedTimeline = null;
+      _translationStatus = 'Übersetze ${source.segments.length} Abschnitte …';
+      _errorMessage = '';
+    });
+    final client = http.Client();
+    try {
+      final timeline = await TimelineTranslator(client).translate(
+        source,
+        _apiKeyController.text.trim(),
+        targetLanguage: targetLanguage,
+        onProgress: (done, total) {
+          if (!mounted) return;
+          setState(
+            () => _translationStatus = '$done von $total Abschnitten übersetzt',
+          );
+          _addLog(_translationStatus);
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _translatedTimeline = timeline;
+        _translatedText = timeline.text;
+        _translationLanguage = targetLanguage;
+      });
+      await _cacheTranslation();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${timeline.segments.length} Abschnitte mit Zeitzuordnung übersetzt und gespeichert.',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _addLog('Abschnittsübersetzung fehlgeschlagen: $e');
+      setState(() => _errorMessage = 'Übersetzung fehlgeschlagen: $e');
+    } finally {
+      client.close();
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _translationStatus = '';
+        });
+      }
+    }
+  }
+
   Future<void> _translateText() async {
+    final targetLanguage = _targetLanguage;
     _clearLogs();
     _addLog('Translation request started...');
 
@@ -718,15 +1398,25 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
       return;
     }
 
+    final source = _sourceTranscript;
+    if (source != null &&
+        source.text == _inputController.text &&
+        source.source == _selectedMediaPath) {
+      await _translateTimedTranscript(source);
+      return;
+    }
+
     setState(() {
       _isLoading = true;
+      _translatedTimeline = null;
       _errorMessage = '';
       _showLogs = true;
     });
 
-    _addLog('API Key: ${_apiKeyController.text.substring(0, 5)}...');
     _addLog('Text length: ${_inputController.text.length} characters');
-    _addLog('Target language: DE (German)');
+    _addLog(
+      'Target language: ${targetLanguage.apiCode} (${targetLanguage.label})',
+    );
 
     try {
       _addLog('Sending request to DeepL API...');
@@ -736,19 +1426,23 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
           'Content-Type': 'application/x-www-form-urlencoded',
           'Authorization': 'DeepL-Auth-Key ${_apiKeyController.text}',
         },
-        body: {'text': _inputController.text, 'target_lang': 'DE'},
+        body: {
+          'text': _inputController.text,
+          'target_lang': targetLanguage.apiCode,
+        },
       );
 
       _addLog('Response status code: ${response.statusCode}');
       _addLog('Response body: ${response.body}');
 
       if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
+        final data = jsonDecode(utf8.decode(response.bodyBytes));
         _addLog('Translation successful!');
         final translatedText = data['translations'][0]['text'];
         final charCount = _inputController.text.length;
         setState(() {
           _translatedText = translatedText;
+          _translationLanguage = targetLanguage;
           _isLoading = false;
         });
         // Automatically cache the translation
@@ -833,15 +1527,229 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
             ),
             const SizedBox(height: 16),
 
+            // Whisper / media transcription integration
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF44475a),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF6272a4)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'Video / MP3 → Text (DmitrysVideo)',
+                    style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _pythonPathController,
+                    decoration: const InputDecoration(
+                      labelText: 'Python executable',
+                      hintText:
+                          'Auto: DmitrysVideo/.venv, or Python executable',
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: DropdownButtonFormField<String>(
+                          key: ValueKey(_whisperModelController.text),
+                          initialValue: _whisperModelController.text.isNotEmpty
+                              ? _whisperModelController.text
+                              : 'small',
+                          decoration: const InputDecoration(
+                            labelText: 'Whisper model',
+                          ),
+                          items: const [
+                            DropdownMenuItem(
+                              value: 'tiny',
+                              child: Text('tiny'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'base',
+                              child: Text('base'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'small',
+                              child: Text('small'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'medium',
+                              child: Text('medium'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'large',
+                              child: Text('large'),
+                            ),
+                          ],
+                          onChanged: _isExtractingMediaText
+                              ? null
+                              : (value) {
+                                  if (value != null) {
+                                    _whisperModelController.text = value;
+                                  }
+                                },
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: DropdownButtonFormField<String>(
+                          key: ValueKey(_whisperLanguageController.text),
+                          initialValue:
+                              _whisperLanguageController.text.isNotEmpty
+                              ? _whisperLanguageController.text
+                              : 'auto',
+                          decoration: const InputDecoration(
+                            labelText: 'Language',
+                          ),
+                          items: const [
+                            DropdownMenuItem(
+                              value: 'auto',
+                              child: Text('auto'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'ru',
+                              child: Text('Russian'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'de',
+                              child: Text('German'),
+                            ),
+                            DropdownMenuItem(
+                              value: 'en',
+                              child: Text('English'),
+                            ),
+                          ],
+                          onChanged: _isExtractingMediaText
+                              ? null
+                              : (value) {
+                                  if (value != null) {
+                                    _whisperLanguageController.text = value;
+                                  }
+                                },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed:
+                              _isExtractingMediaText ||
+                                  _isLoading ||
+                                  _isExportingVideo
+                              ? null
+                              : _selectMediaFile,
+                          icon: const Icon(Icons.attach_file),
+                          label: const Text('Select media'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed:
+                              _isExtractingMediaText ||
+                                  _isLoading ||
+                                  _isExportingVideo
+                              ? null
+                              : _extractTextFromMedia,
+                          icon: _isExtractingMediaText
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.text_snippet),
+                          label: Text(
+                            _isExtractingMediaText
+                                ? 'Extracting...'
+                                : 'Extract text',
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _selectedMediaName,
+                    style: TextStyle(fontSize: 12, color: Colors.grey[300]),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  if (_isExtractingMediaText) ...[
+                    const SizedBox(height: 12),
+                    ExtractionActivity(phase: _extractionPhase),
+                  ],
+                  const SizedBox(height: 8),
+                  ElevatedButton(
+                    onPressed: _saveWhisperSettings,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF6272a4),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ),
+                    child: const Text(
+                      'Save Whisper settings',
+                      style: TextStyle(fontSize: 12, color: Colors.white),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+
             // Input Text
+            DropdownButtonFormField<TranslationLanguage>(
+              key: ValueKey(_targetLanguage),
+              initialValue: _targetLanguage,
+              decoration: const InputDecoration(labelText: 'Zielsprache'),
+              items: TranslationLanguage.values
+                  .map(
+                    (language) => DropdownMenuItem(
+                      value: language,
+                      child: Text(language.label),
+                    ),
+                  )
+                  .toList(),
+              onChanged: _isLoading || _isExportingAudio || _isExportingVideo
+                  ? null
+                  : (language) async {
+                      if (language == null) return;
+                      setState(() => _targetLanguage = language);
+                      final prefs = await SharedPreferences.getInstance();
+                      await prefs.setString(
+                        'translation_target_language',
+                        language.code,
+                      );
+                    },
+            ),
+            const SizedBox(height: 12),
             TextField(
               controller: _inputController,
+              enabled:
+                  !_isLoading && !_isExtractingMediaText && !_isExportingVideo,
               onChanged: (value) {
-                setState(() {});
+                setState(() {
+                  _sourceTranscript = _sourceTranscript?.editedText(value);
+                  _translatedTimeline = null;
+                });
               },
-              decoration: const InputDecoration(
-                labelText: 'Text to Translate (English)',
+              decoration: InputDecoration(
+                labelText: 'Text to Translate',
                 hintText: 'Enter your text here...',
+                helperText: _sourceTranscript != null
+                    ? '${_sourceTranscript!.segments.length} Abschnitte mit Zeitstempeln. Eine Zeile pro Abschnitt beibehalten.'
+                    : null,
+                helperMaxLines: 2,
               ),
               maxLines: 8,
             ),
@@ -876,7 +1784,12 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
               children: [
                 Expanded(
                   child: ElevatedButton(
-                    onPressed: _isLoading ? null : _translateText,
+                    onPressed:
+                        _isLoading ||
+                            _isExtractingMediaText ||
+                            _isExportingVideo
+                        ? null
+                        : _translateText,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFFbd93f9),
                       disabledBackgroundColor: Colors.grey[700],
@@ -909,7 +1822,12 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: ElevatedButton(
-                    onPressed: _importTranslation,
+                    onPressed:
+                        _isLoading ||
+                            _isExportingVideo ||
+                            _isExtractingMediaText
+                        ? null
+                        : _importTranslation,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF8be9fd),
                       padding: const EdgeInsets.symmetric(vertical: 10),
@@ -930,7 +1848,12 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: ElevatedButton(
-                    onPressed: _loadCachedTranslation,
+                    onPressed:
+                        _isLoading ||
+                            _isExportingVideo ||
+                            _isExtractingMediaText
+                        ? null
+                        : _loadCachedTranslation,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF6272a4),
                       padding: const EdgeInsets.symmetric(vertical: 10),
@@ -974,6 +1897,12 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
             const SizedBox(height: 16),
 
             // Error Message
+            if (_isLoading && _translationStatus.isNotEmpty) ...[
+              const LinearProgressIndicator(),
+              const SizedBox(height: 8),
+              Text(_translationStatus, style: const TextStyle(fontSize: 12)),
+              const SizedBox(height: 12),
+            ],
             if (_errorMessage.isNotEmpty)
               Container(
                 padding: const EdgeInsets.all(12),
@@ -1008,7 +1937,7 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text(
-                          'Translation (German):',
+                          'Translation (${_translationLanguage.englishLabel}):',
                           style: TextStyle(
                             fontWeight: FontWeight.bold,
                             fontSize: 13,
@@ -1016,7 +1945,9 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
                           ),
                         ),
                         GestureDetector(
-                          onTap: _editTranslation,
+                          onTap: _isExportingVideo || _isLoading
+                              ? null
+                              : _editTranslation,
                           child: Container(
                             padding: const EdgeInsets.all(8),
                             decoration: BoxDecoration(
@@ -1046,6 +1977,67 @@ class _TranslatorScreenState extends State<TranslatorScreen> {
 
             // Export and Save buttons
             if (_translatedText.isNotEmpty) ...[
+              if (_hasVideo) ...[
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed:
+                      _canExportVideo &&
+                          !_isExportingVideo &&
+                          !_isLoading &&
+                          !_isExtractingMediaText &&
+                          !_isExportingAudio
+                      ? _exportVideo
+                      : null,
+                  icon: const Icon(Icons.video_file_rounded),
+                  label: Text(
+                    _isExportingVideo
+                        ? 'Video wird erstellt …'
+                        : _translationLanguage.videoLabel,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  _canExportVideo
+                      ? '${_translatedTimeline!.segments.length} Abschnitte mit ursprünglichen Startzeiten. '
+                            'Sprechtempo bleibt unverändert; Überschneidungen werden nach hinten verschoben.'
+                      : 'Für den Videoexport das Video extrahieren und anschließend mit Translate abschnittsweise übersetzen.',
+                  style: const TextStyle(fontSize: 12),
+                ),
+                if (_isExportingVideo) ...[
+                  const SizedBox(height: 8),
+                  LinearProgressIndicator(value: _videoProgress),
+                  const SizedBox(height: 6),
+                  Text(_videoStatus, style: const TextStyle(fontSize: 12)),
+                  TextButton.icon(
+                    onPressed: _videoExporter.cancel,
+                    icon: const Icon(Icons.cancel_outlined),
+                    label: const Text('Videoexport abbrechen'),
+                  ),
+                ],
+              ],
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: _isExportingAudio || _isExportingVideo
+                    ? null
+                    : _exportMp3,
+                icon: const Icon(Icons.headphones_rounded),
+                label: Text(
+                  _isExportingAudio
+                      ? 'Sprachausgabe wird erstellt …'
+                      : 'Als MP3 speichern',
+                ),
+              ),
+              if (_isExportingAudio) ...[
+                const SizedBox(height: 8),
+                LinearProgressIndicator(value: _audioProgress),
+                const SizedBox(height: 6),
+                Text(_audioStatus, style: const TextStyle(fontSize: 12)),
+                TextButton.icon(
+                  onPressed: _audioExporter.cancel,
+                  icon: const Icon(Icons.cancel_outlined),
+                  label: const Text('MP3-Export abbrechen'),
+                ),
+              ],
               const SizedBox(height: 12),
               Row(
                 children: [
